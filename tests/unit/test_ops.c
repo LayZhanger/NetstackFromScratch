@@ -1,6 +1,6 @@
 /*
  * test_ops.c — c-style skill 面向对象机制的单元测试（check 框架）。
- * 验证：基类+ops 表、结构体嵌套继承、多态分派、self 首参、container_of、无 malloc 初始化。
+ * 验证：基类+ops 表、结构体嵌套继承、多态分派、self 首参、container_of、static 实例就地初始化。
  * 运行：cmake -S tests -B <build> && cmake --build <build> && <build>/test_ops
  */
 #include <check.h>
@@ -187,8 +187,8 @@ START_TEST(test_container_of)
 }
 END_TEST
 
-/* 无 malloc：static 实例就地初始化后直接可用 */
-START_TEST(test_init_no_malloc)
+/* static 实例就地初始化后直接可用（教学默认简单优先） */
+START_TEST(test_init_static)
 {
     static struct hubport_netdev g_hp;
     struct netdev *nd = &g_hp.base;
@@ -209,7 +209,7 @@ static Suite *make_suite(void)
     tcase_add_test(tc, test_polymorphism);
     tcase_add_test(tc, test_self_first_arg);
     tcase_add_test(tc, test_container_of);
-    tcase_add_test(tc, test_init_no_malloc);
+    tcase_add_test(tc, test_init_static);
     suite_add_tcase(s, tc);
     return s;
 }

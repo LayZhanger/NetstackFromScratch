@@ -25,9 +25,10 @@ netstack-from-scratch/
 │   ├── include/    types.h byteorder.h checksum.h
 │   ├── eth/  arp/  ip/  icmp/  udp/  quic/   ← 按层
 │   ├── netdev/     netdev.h + 实现（hub 端口）
-│   └── app/        echo.c http.c
+│   └── app/       按层 demo（netdev/ eth/ ...）+ echo/http
 ├── tests/          link/hub 脚本 + Python 单测
-└── scripts/        hub 启动、tap 配置
+├── hub/            hub 虚拟交换机（C 实现，独立进程；含 tap 端口支持）
+└── scripts/        tap 配置等辅助脚本
 ```
 
 ## 各层与 RFC 对照
