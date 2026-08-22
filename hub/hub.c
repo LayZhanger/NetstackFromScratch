@@ -1,37 +1,24 @@
 /*
- * hub.c：虚拟交换机（docs/02-netdev与hub.md §5，01-架构.md §4 简化版）。
- * 独立进程：listen unix socket，连接即端口注册；select 单线程驱动，无并发。
- * 转发规则（阶段零简化）：收到某端口一帧 → 原样写往其它所有端口（共享介质语义）。
- * 广播/组播/单播细分留到 eth 阶段（01-架构.md §4 转发规则表）。
- * 用法：hub <socket_path> [丢包率0% 丢包率1% ...]   （按连接注册顺序对应端口）
+ * hub.c：虚拟交换机核心（01-架构.md §4）。
+ * 复用 netdev：每个端口 = 一个 netdev（unix_socket 后端 SERVER 角色），
+ * socket/accept/线程全在 netdev 内部，本文件不写任何 socket 代码。
+ * 转发 = 端口 netdev 的 rx_handler：收到一帧 → 转发到其它所有端口（共享介质语义）。
+ * 本阶段简化转发（广播语义）：对每个其它端口 netdev_send；单播/组播细分留到 eth 阶段。
+ * 启动固定配置：hub_init 创建并启动 N 个端口 netdev，之后由各自内部线程驱动。
+ * 用法：hub <socket_base> <nports> [丢包率0% 丢包率1% ...]
  */
 
-#include <errno.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
-#define HUB_MAX_PORTS 8         /* 端口表静态数组，编译期定（教学默认简单优先） */
-#define HUB_BUFSIZE 2048
+#include "hub.h"
+#include "netdev_factory.h"
+#include "impl/unix_socket_netdev.h"
 
-struct hub_port {
-	int  fd;                    /* -1 = 空闲 */
-	int  loss;                  /* 丢包率百分比 0-100（01-架构.md §4 确定性测试） */
-	unsigned long rx_frames;    /* 收到帧数 */
-	unsigned long tx_frames;    /* 转发帧数 */
-	unsigned long dropped;      /* 因丢包率丢弃帧数 */
-};
-
-static struct hub_port ports[HUB_MAX_PORTS];
-static int listen_fd = -1;
+static struct hub *g_hub;   /* 单实例进程：供 rx_handler 定位 hub 与源端口 */
 
 static void hexdump(const uint8_t *buf, size_t len)
 {
@@ -55,176 +42,143 @@ static void log_frame(const char *dir, int src, int dst, const uint8_t *buf,
 	hexdump(buf, len);
 }
 
-static int port_add(int fd)
+/* 端口收到一帧：转发到其它所有端口（01-架构.md §4 广播语义的简化） */
+static void hub_rx_handler(struct netdev *self, uint8_t *buf, size_t len)
 {
-	int i;
+	struct hub *hub = g_hub;
+	int src = -1, dst, i;
 
-	for (i = 0; i < HUB_MAX_PORTS; i++) {
-		if (ports[i].fd < 0) {
-			ports[i].fd = fd;
-			printf("== 端口%d 上线 ==\n", i);
-			return i;
+	for (i = 0; i < hub->nports; i++) {
+		if (hub->ports[i] == self) {
+			src = i;
+			break;
 		}
 	}
-	fprintf(stderr, "hub: 端口已满 (%d)\n", HUB_MAX_PORTS);
-	return -1;
-}
-
-static void port_remove(int idx)
-{
-	printf("== 端口%d 下线 ==\n", idx);
-	close(ports[idx].fd);
-	ports[idx].fd = -1;
-	ports[idx].loss = 0;
-}
-
-/* 按端口丢包率决定是否丢弃（确定性测试用） */
-static int should_drop(int idx)
-{
-	struct hub_port *p = &ports[idx];
-
-	if (p->loss <= 0)
-		return 0;
-	return (rand() % 100) < p->loss;
-}
-
-/* 收到 src 端口一帧：转发到其它所有端口（01-架构.md §4 广播语义的简化） */
-static void hub_forward(int src, const uint8_t *buf, size_t len)
-{
-	int dst;
-
-	ports[src].rx_frames++;
-	for (dst = 0; dst < HUB_MAX_PORTS; dst++) {
-		size_t written = 0;
-
-		if (dst == src || ports[dst].fd < 0)
+	if (src < 0) {              /* 未知端口：按 netdev 契约释放 buf */
+		free(buf);
+		return;
+	}
+	for (dst = 0; dst < hub->nports; dst++) {
+		if (dst == src)
 			continue;
-		if (should_drop(dst)) {
-			ports[dst].dropped++;
+		if (hub->loss[dst] > 0 &&
+		    (rand() % 100) < hub->loss[dst]) {
+			hub->dropped[dst]++;
 			printf("[丢包] 端口%d -> 端口%d len=%zu\n", src, dst, len);
 			continue;
 		}
-		while (written < len) {
-			ssize_t n = write(ports[dst].fd, buf + written, len - written);
-
-			if (n < 0) {
-				if (errno == EINTR)
-					continue;
-				port_remove(dst);
-				break;
-			}
-			written += (size_t)n;
+		if (netdev_send(hub->ports[dst], buf, len) < 0) {
+			printf("端口%d -> 端口%d 发送失败\n", src, dst);
+			continue;
 		}
-		if (written == len) {
-			ports[dst].tx_frames++;
-			log_frame("->", src, dst, buf, len);
-		}
+		log_frame("->", src, dst, buf, len);
 	}
+	free(buf);
 }
 
-static void hub_handle_rx(int idx)
+int hub_init(struct hub *self, const char *sock_base, int nports,
+	     const int *loss_by_port, int nloss)
 {
-	uint8_t buf[HUB_BUFSIZE];
-	ssize_t n = read(ports[idx].fd, buf, sizeof(buf));
+	int i;
 
-	if (n < 0) {
-		if (errno == EINTR)
-			return;
-		port_remove(idx);
-		return;
+	if (!self || !sock_base || nports <= 0 || nports > HUB_MAX_PORTS)
+		return -1;
+	memset(self, 0, sizeof(*self));
+	if (strlen(sock_base) >= HUB_SOCK_PATH_SIZE)
+		return -1;
+	self->nports = nports;
+	strncpy(self->sock_base, sock_base, HUB_SOCK_PATH_SIZE - 1);
+	self->sock_base[HUB_SOCK_PATH_SIZE - 1] = '\0';
+
+	/* 固定配置：每端口一个 server-role netdev，路径 <base>-<i>.sock */
+	for (i = 0; i < nports; i++) {
+		struct unix_socket_params p;
+		char path[HUB_SOCK_PATH_SIZE];
+		struct netdev *nd;
+
+		snprintf(path, sizeof(path), "%s-%d.sock", sock_base, i);
+		p.sock_path = path;
+		p.name = path;
+		p.role = UNIX_SOCK_ROLE_SERVER;
+		nd = netdev_create("unix_socket", &p);
+		if (!nd) {
+			perror("netdev_create");
+			goto fail;
+		}
+		if (i < nloss)
+			self->loss[i] = loss_by_port[i];
+		netdev_set_rx_handler(nd, hub_rx_handler);
+		if (netdev_start(nd) < 0) {
+			netdev_destroy(nd);
+			goto fail;
+		}
+		self->ports[i] = nd;
 	}
-	if (n == 0) {           /* 对端关闭 */
-		port_remove(idx);
-		return;
+	g_hub = self;
+	return 0;
+
+fail:
+	for (i = 0; i < self->nports; i++)
+		if (self->ports[i])
+			netdev_destroy(self->ports[i]);
+	memset(self->ports, 0, sizeof(self->ports));
+	return -1;
+}
+
+void hub_run(struct hub *self)
+{
+	(void)self;
+	printf("== hub 启动: %s（端口 %d 个）==\n", self->sock_base,
+	       self->nports);
+	/* 端口 netdev 各自内部线程已驱动收发（start 时已启动）；
+	 * hub 主循环无需 select/accept，仅阻塞等待（线程驱动一切）。 */
+	for (;;)
+		pause();
+}
+
+void hub_destroy(struct hub *self)
+{
+	int i;
+
+	for (i = 0; i < self->nports; i++) {
+		if (self->ports[i]) {
+			netdev_destroy(self->ports[i]);
+			self->ports[i] = NULL;
+		}
 	}
-	/* 阶段零简化：一次 read 的一块 = 一帧（docs/02-netdev与hub.md §4） */
-	hub_forward(idx, buf, (size_t)n);
 }
 
 int main(int argc, char *argv[])
 {
-	struct sockaddr_un addr;
-	fd_set rfds;
-	int i, maxfd;
+	struct hub hub;
+	int loss[HUB_MAX_PORTS];
+	int nloss = 0, nports = 0, i;
 
 	setvbuf(stdout, NULL, _IONBF, 0);   /* 日志重定向时也要实时可见 */
-	if (argc < 2) {
-		fprintf(stderr, "用法: %s <socket_path> [丢包率0%% 丢包率1%% ...]\n",
+	if (argc < 3) {
+		fprintf(stderr, "用法: %s <socket_base> <nports> [丢包率0%% ...]\n",
 			argv[0]);
 		return 1;
 	}
 	srand((unsigned)time(NULL));
 
-	for (i = 0; i < HUB_MAX_PORTS; i++)
-		ports[i].fd = -1;
+	nports = atoi(argv[2]);
+	if (nports <= 0 || nports > HUB_MAX_PORTS) {
+		fprintf(stderr, "hub: 端口数须在 1-%d 之间\n", HUB_MAX_PORTS);
+		return 1;
+	}
+	for (i = 3; i < argc && nloss < nports; i++) {
+		loss[nloss] = atoi(argv[i]);
+		if (loss[nloss] > 100)
+			loss[nloss] = 100;
+		nloss++;
+	}
 
-	unlink(argv[1]);
-	listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (listen_fd < 0) {
-		perror("socket");
+	if (hub_init(&hub, argv[1], nports, loss, nloss) < 0) {
+		fprintf(stderr, "hub: 初始化失败\n");
 		return 1;
 	}
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	if (strlen(argv[1]) >= sizeof(addr.sun_path)) {
-		fprintf(stderr, "hub: socket 路径过长\n");
-		return 1;
-	}
-	strcpy(addr.sun_path, argv[1]);
-	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("bind");
-		return 1;
-	}
-	if (listen(listen_fd, 8) < 0) {
-		perror("listen");
-		return 1;
-	}
-	printf("== hub 启动: %s（端口上限 %d）==\n", argv[1], HUB_MAX_PORTS);
-
-	for (;;) {
-		FD_ZERO(&rfds);
-		FD_SET(listen_fd, &rfds);
-		maxfd = listen_fd;
-		for (i = 0; i < HUB_MAX_PORTS; i++) {
-			if (ports[i].fd >= 0) {
-				FD_SET(ports[i].fd, &rfds);
-				if (ports[i].fd > maxfd)
-					maxfd = ports[i].fd;
-			}
-		}
-		if (select(maxfd + 1, &rfds, NULL, NULL, NULL) < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("select");
-			break;
-		}
-		if (FD_ISSET(listen_fd, &rfds)) {
-			int fd = accept(listen_fd, NULL, NULL);
-			int idx;
-
-			if (fd < 0) {
-				perror("accept");
-				continue;
-			}
-			idx = port_add(fd);
-			if (idx < 0) {
-				close(fd);
-				continue;
-			}
-			/* 丢包率参数按连接注册顺序依次对应端口 0,1,2... */
-			if (argc > idx + 2) {
-				ports[idx].loss = atoi(argv[idx + 2]);
-				if (ports[idx].loss > 100)
-					ports[idx].loss = 100;
-				if (ports[idx].loss > 0)
-					printf("== 端口%d 丢包率 %d%% ==\n", idx,
-					       ports[idx].loss);
-			}
-		}
-		for (i = 0; i < HUB_MAX_PORTS; i++) {
-			if (ports[i].fd >= 0 && FD_ISSET(ports[i].fd, &rfds))
-				hub_handle_rx(i);
-		}
-	}
+	hub_run(&hub);
+	hub_destroy(&hub);
 	return 0;
 }

@@ -10,10 +10,13 @@ cmake --build "$BUILD_DIR"
 
 echo "== 编译工具与演示进程 =="
 mkdir -p dist/bin
-gcc -std=c99 -Wall -Wextra -O2 -o dist/bin/hub hub/hub.c
-gcc -std=c99 -Wall -Wextra -O2 -Isrc/include -Isrc/netdev \
-    -o dist/bin/netdev_demo src/app/netdev/demo.c src/netdev/netdev.c src/netdev/hubport.c
+gcc -std=c99 -Wall -Wextra -O2 -pthread -Isrc/include -Isrc/netdev -Isrc/netdev/impl \
+    -o dist/bin/hub hub/hub.c src/netdev/netdev.c src/netdev/netdev_factory.c \
+    src/netdev/impl/unix_socket_netdev.c
+gcc -std=c99 -Wall -Wextra -O2 -pthread -Isrc/include -Isrc/netdev -Isrc/netdev/impl \
+    -o dist/bin/netdev_demo src/app/netdev/demo.c src/netdev/netdev.c \
+    src/netdev/netdev_factory.c src/netdev/impl/unix_socket_netdev.c
 
 echo "== 运行测试 =="
 "$BUILD_DIR/unit/test_ops"
-"$BUILD_DIR/unit/test_hubport"
+"$BUILD_DIR/unit/test_unix_socket_netdev"

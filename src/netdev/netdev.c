@@ -10,9 +10,9 @@ int netdev_init(struct netdev *self)
 	return self->ops->init(self);
 }
 
-int netdev_poll(struct netdev *self, int timeout_ms)
+int netdev_start(struct netdev *self)
 {
-	return self->ops->poll(self, timeout_ms);
+	return self->ops->start(self);
 }
 
 int netdev_send(struct netdev *self, const uint8_t *buf, size_t len)
@@ -20,9 +20,9 @@ int netdev_send(struct netdev *self, const uint8_t *buf, size_t len)
 	return self->ops->send(self, buf, len);
 }
 
-void netdev_periodic(struct netdev *self)
+void netdev_stop(struct netdev *self)
 {
-	self->ops->periodic(self);
+	self->ops->stop(self);
 }
 
 void netdev_set_rx_handler(struct netdev *self, netdev_rx_handler_t h)

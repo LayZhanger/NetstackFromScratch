@@ -4,7 +4,7 @@
 /*
  * container_of：内核标志性宏。
  * 子结构内嵌基结构（继承），拿到基结构指针后反推包含它的完整结构。
- * 用法：container_of(nd, struct hubport_netdev, base)
+ * 用法：container_of(nd, struct unix_socket_netdev, base)
  *   nd    = 指向内嵌成员 base 的指针
  *   type  = 外层结构类型
  *   member = 内嵌成员名（须与 type 中的成员一致）
